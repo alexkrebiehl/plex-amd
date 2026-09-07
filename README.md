@@ -182,6 +182,7 @@ instead. This exercises device access, driver load, constructors and a real enco
 ```sh
 dd if=/dev/urandom of=/tmp/in.nv12 bs=1382400 count=30      # 30 frames of 1280x720
 docker run --rm --device /dev/dri/renderD128 -v /tmp:/tmp --entrypoint /bin/sh plex-amd:test -c '
+  MESA_SHADER_CACHE_DISABLE=true \
   "/usr/lib/plexmediaserver/Plex Transcoder" -hide_banner \
     -f rawvideo -pix_fmt nv12 -s 1280x720 -r 30 -i /tmp/in.nv12 \
     -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw \
@@ -189,6 +190,18 @@ docker run --rm --device /dev/dri/renderD128 -v /tmp:/tmp --entrypoint /bin/sh p
 ```
 
 Expect `frame=30` and exit 0. `LIBVA_MESSAGING_LEVEL=2` shows libva's driver search.
+
+`MESA_SHADER_CACHE_DISABLE=true` matters: this command runs as **root**, while Plex runs as `plex`.
+Without it Mesa creates `$HOME/.cache` (Plex's `HOME` is `/config`) owned by root and mode 0700, and
+Plex can then no longer write its shader cache:
+
+```
+Failed to create /config/.cache/mesa_shader_cache for shader cache (Permission denied)---disabling.
+```
+
+The consequence is minor - Mesa recompiles its shaders in every transcoder process, and VAAPI
+encode/decode is fixed-function anyway - but it is waste, and the error is misleading. The init hook
+repairs the ownership at each start, so it self-corrects; not creating the mess is still better.
 
 Note that `:public` downloads Plex at container start, so `Plex Transcoder` only exists after the
 container has run its init scripts once.
@@ -213,6 +226,6 @@ This image makes it possible; nothing here can enable it.
 Dockerfile                                four stages: plex-ref, mesa, gate, image
 scripts/collect-libs.sh                   DT_NEEDED closure, the musl loader, RPATH
 scripts/gate.sh                           the three compatibility gates
-root/etc/cont-init.d/55-vaapi-musl        swaps Plex's libc at every start
+root/etc/cont-init.d/55-vaapi-musl        swaps Plex's libc, repairs cache ownership
 .github/workflows/build.yml               push + weekly build to ghcr.io
 ```

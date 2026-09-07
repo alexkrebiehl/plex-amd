@@ -72,3 +72,30 @@ if [ "$replaced" -eq 0 ]; then
 else
 	log "replaced Plex's musl with $("$NEW" 2>&1 | sed -n 's/^Version /musl /p') ($replaced file(s))"
 fi
+
+# Keep Mesa's shader cache writable by the plex user.
+#
+# Mesa caches compiled shaders under $HOME/.cache, and Plex's HOME is /config.
+# Anything that runs the transcoder by hand inside the container - the
+# verification command in README.md, for instance - runs as root and creates
+# that directory root-owned and mode 0700. PMS runs as plex and then cannot use
+# it, so Mesa logs
+#
+#   Failed to create /config/.cache/mesa_shader_cache for shader cache
+#   (Permission denied)---disabling.
+#
+# and recompiles its shaders in every transcoder process instead. Harmless -
+# VAAPI encode/decode is fixed-function, and shaders only cover colour
+# conversion, scaling and blits - but it is pure waste and a confusing error.
+#
+# pms-docker's own CHANGE_CONFIG_DIR_OWNERSHIP repair does not catch this: it
+# only runs when Preferences.xml itself is not plex-owned.
+plexhome=$(getent passwd plex 2>/dev/null | cut -d: -f6)
+cachedir="${plexhome:-/config}/.cache"
+if [ -d "$cachedir" ] && [ "$(stat -c %u "$cachedir" 2>/dev/null)" != "$(id -u plex 2>/dev/null)" ]; then
+	if chown -R plex:plex "$cachedir" 2>/dev/null; then
+		log "repaired ownership of $cachedir (shader cache was unwritable)"
+	else
+		log "WARNING: $cachedir is not writable by plex; Mesa will recompile shaders each run"
+	fi
+fi
