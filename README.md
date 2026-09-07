@@ -1,5 +1,25 @@
 # plex-amd
 
+> ## Status: parked, not in use
+>
+> **This image is no longer deployed.** Two things turned out to be wrong with its premise.
+>
+> **1. Plex ships its own AMD VA driver at runtime.** Plex 1.43 downloads `radeonsi_drv_video.so`
+> into `Cache/va-dri-linux-x86_64` and overrides `LIBVA_DRIVERS_PATH` when it launches the
+> transcoder. So the Mesa payload here is only ever used by Plex Media Server's in-process
+> capability probe - never by the actual transcode. "The official image ships no VA driver" is true
+> of the image, but not of Plex at runtime.
+>
+> **2. Hardware transcoding is broken on this GPU for a reason none of this addresses.** Plex's
+> transcoder segfaults whenever `-copyts` is combined with `h264_vaapi`, and Plex sends `-copyts` on
+> every segmented streaming session. It crashes with Plex's own driver, under Plex's own musl 1.2.2,
+> on a completely unmodified image. See [PLEX-BUG-REPORT.md](PLEX-BUG-REPORT.md).
+>
+> The engineering below is sound and independently verified - the musl analysis is correct, and
+> hardware encode works at every resolution up to 4K when `-copyts` is absent. It just does not solve
+> the problem that actually blocks playback. Kept for the diagnosis and in case Plex fixes the crash.
+
+
 Plex Media Server with a working AMD VAAPI driver, for hardware transcoding on an AMD GPU or iGPU.
 
 Published to `ghcr.io/alexkrebiehl/plex-amd:latest`. Consumed by
