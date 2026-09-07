@@ -5,21 +5,26 @@
 # an ordinary CI runner.
 set -eu
 
-LOADER=/plex/ld-musl-x86_64.so.1
+PLEX_LOADER=/plex/ld-musl-x86_64.so.1
 PLEX_LIBVA=/plex/libva.so.2
 PAYLOAD=/vaapi-amdgpu
+OUR_LOADER="$PAYLOAD/lib/ld-musl-x86_64.so.1"
 DRIVER="$PAYLOAD/lib/dri/radeonsi_drv_video.so"
 
 fail() { echo "GATE FAILED: $*" >&2; exit 1; }
 
-[ -e "$DRIVER" ] || fail "no driver at $DRIVER"
+# musl's loader prints "musl libc (x86_64)\nVersion X.Y.Z" when run bare.
+musl_version() { "$1" 2>&1 | sed -n 's/^Version //p' | head -1; }
+as_int() { echo "$1" | awk -F. '{printf "%d", $1*10000 + $2*100 + $3}'; }
 
-echo "== gate 1: relocation against Plex's own musl loader =="
-# musl relocates eagerly, so every symbol in the driver and its entire closure is
-# resolved here exactly as it would be at dlopen() time inside Plex Transcoder.
-# A missing symbol sets ldso_fail, which exits 127 before ldd mode's exit(0), so
-# the exit code is trustworthy.
-"$LOADER" --library-path "$PAYLOAD/lib" --list "$DRIVER"
+[ -e "$DRIVER" ] || fail "no driver at $DRIVER"
+[ -x "$OUR_LOADER" ] || fail "no bundled loader at $OUR_LOADER"
+
+echo "== gate 1: the driver relocates under the loader we ship =="
+# musl relocates eagerly, so every symbol in the driver and its whole closure is
+# resolved here. ldso_fail exits 127 before ldd mode's exit(0), so the exit code
+# is trustworthy. This catches a dependency missing from the payload.
+"$OUR_LOADER" --library-path "$PAYLOAD/lib" --list "$DRIVER"
 echo "  relocation clean"
 
 echo "== gate 2: libva ABI =="
@@ -37,13 +42,20 @@ echo "  driver exports __vaDriverInit_1_$drv_minor; Plex ships VA-API 1.$plex_mi
 [ "$drv_minor" -le "$plex_minor" ] ||
 	fail "driver was built against a newer libva than Plex ships; Plex would never load it"
 
-echo "== gate 3: no second libc in the payload =="
-# musl blocks loading a second libc (dynlink.c, "Catch and block attempts to
-# reload the implementation itself"), so one bundled here would be silently
-# ignored and give a false sense that a version gap had been papered over.
-if ls "$PAYLOAD"/lib/libc.musl-* "$PAYLOAD"/lib/ld-musl-* >/dev/null 2>&1; then
-	fail "payload bundles a libc; musl will ignore it (use the shim instead)"
+echo "== gate 3: the loader we ship is newer than Plex's =="
+# The whole design rests on this. Plex's musl 1.2.2 cannot dlopen this Mesa - it
+# segfaults in the driver's constructors at an indirect call - so the transcoder
+# is launched with the loader from the payload instead. If Plex ever catches up,
+# the wrapper stops buying anything and this needs revisiting.
+ours=$(musl_version "$OUR_LOADER")
+theirs=$(musl_version "$PLEX_LOADER")
+[ -n "$ours" ] || fail "could not read the bundled loader's version"
+[ -n "$theirs" ] || fail "could not read Plex's loader version"
+echo "  payload musl $ours vs Plex musl $theirs"
+[ "$(as_int "$ours")" -ge "$(as_int "$theirs")" ] ||
+	fail "the bundled loader ($ours) is older than Plex's ($theirs)"
+if [ "$(as_int "$ours")" -eq "$(as_int "$theirs")" ]; then
+	echo "  WARNING: identical musl versions - the wrapper is buying nothing"
 fi
-echo "  clean"
 
 echo "all gates passed"

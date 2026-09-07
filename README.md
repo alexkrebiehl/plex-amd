@@ -24,36 +24,22 @@ somewhere else, and this repo supplies it.
 Getting the *device* into the container is a separate problem, solved separately by the device
 plugin. This repo solves only the *driver* problem.
 
-## How it works
+## Why the loader is the crux
 
-An Alpine builder collects Mesa's `radeonsi_drv_video.so` and its complete `DT_NEEDED` closure into
-`/vaapi-amdgpu`, and the final image sets one environment variable:
+This is the expensive fact, and it is not the one it first appears to be.
 
-```
-LIBVA_DRIVERS_PATH=/vaapi-amdgpu/lib/dri
-```
+**Plex bundles musl 1.2.2.** Its loader lives at `/usr/lib/plexmediaserver/lib/ld-musl-x86_64.so.1`
+and its version banner says `1.2.2`. Alpine's Mesa is built against musl 1.2.5.
 
-Plex's own `libva` picks the driver up from there. The payload lives outside
-`/usr/lib/plexmediaserver` on purpose — see "How Plex stays up to date".
-
-## Why a shim
-
-This is the expensive fact. **Plex bundles musl 1.2.2. Alpine's Mesa needs musl 1.2.3 or newer.**
-
-Plex ships its own loader at `/usr/lib/plexmediaserver/lib/ld-musl-x86_64.so.1`; its version banner
-says `1.2.2` and its `.dynsym` has no `qsort_r`, which musl added in 1.2.3. Mesa's `libgallium`
-needs `qsort_r`, so loading Alpine's Mesa into Plex Transcoder fails with:
+The first symptom is a missing symbol — `qsort_r`, which musl added in 1.2.3:
 
 ```
-Error relocating /vaapi-amdgpu/lib/dri/radeonsi_drv_video.so: qsort_r: symbol not found
+Error relocating .../radeonsi_drv_video.so: qsort_r: symbol not found
 ```
 
-Every Alpine from 3.17 to 3.22 (Mesa 22.2.5 through 25.1.9) fails identically, and Mesa below 22.2
-does not support this generation of hardware, so no version threads the needle.
-
-**Bundling Alpine's `libc.musl-x86_64.so.1` alongside does not help**, even though it looks like it
-should, and this is what other AMD/Plex mods do. musl's loader hard-blocks reloading its own
-implementation — `ldso/dynlink.c`:
+That one is fixable, and bundling Alpine's `libc.musl-x86_64.so.1` alongside is *not* how (which is
+what other AMD/Plex mods try). musl's loader hard-blocks reloading its own implementation —
+`ldso/dynlink.c`:
 
 ```c
 /* Catch and block attempts to reload the implementation itself */
@@ -63,18 +49,54 @@ if (name[0]=='l' && name[1]=='i' && name[2]=='b') {
         is_self = 1;
 ```
 
-Any `DT_NEEDED` beginning `libc.` resolves to the *running* loader — Plex's 1.2.2. The second copy
-is silently ignored.
+Any `DT_NEEDED` beginning `libc.` resolves to the *running* loader. The second copy is ignored.
 
-What does work is defining the missing symbol in a *separate* DSO and putting that DSO in the
-driver's dependency chain. That is `shim/plexcompat.c` → `libplexcompat.so.1`, attached with
-`patchelf --add-needed` to every library that actually references one of its symbols.
-`qsort_r` needs nothing from libc internals, so the shim is a self-contained heapsort built with
-`-nostdlib` and introduces no dependencies of its own.
+**But fixing the symbol is not enough.** With `qsort_r` supplied by a shim, relocation succeeded and
+the driver still died — libva found and opened it, then the process took a `SIGSEGV`:
 
-The full dependency closure was resolved and every undefined symbol diffed against Plex's musl
-exports: **`qsort_r` is the only real gap.** Everything else is either provided by a bundled library
-or is a weak symbol (`_ITM_*`, `_ZGTt*`, `_ZTH*`, `ZSTD_trace_*`) that is expected to be unresolved.
+```
+libva: Trying to open /vaapi-amdgpu/lib/dri/radeonsi_drv_video.so
+Segmentation fault
+```
+```
+Plex Transcoder[140460]: segfault at 2100 ip 0000000000002100 error 14
+```
+
+`ip` equal to the fault address, at a tiny value, is an indirect call through a bogus function
+pointer — inside the driver's constructors, which run during `dlopen` and which the relocation-only
+check never exercises.
+
+The A/B that settles it: **same transcoder binary, same driver, same GPU, only the loader changed.**
+
+| Loader | Result |
+|---|---|
+| Plex's musl 1.2.2 | `SIGSEGV` during `dlopen` of the driver |
+| Alpine's musl 1.2.5 | 30 frames encoded, `h264_vaapi`, `speed=2.16x`, exit 0 |
+
+So the fix is not a shim — it is to run the transcoder under the newer loader. The payload ships
+`ld-musl-x86_64.so.1` from the same Alpine as Mesa, and `/etc/cont-init.d/55-vaapi-transcoder`
+replaces `Plex Transcoder` with a wrapper that exec's it:
+
+```sh
+exec /vaapi-amdgpu/lib/ld-musl-x86_64.so.1 \
+  --library-path /usr/lib/plexmediaserver/lib:/vaapi-amdgpu/lib \
+  "/usr/lib/plexmediaserver/Plex Transcoder.real" "$@"
+```
+
+Plex's binaries are built against musl 1.2.2, and musl is forward-compatible, so running them on
+1.2.5 is the safe direction. Only the transcoder is wrapped — it is the only process that loads the
+VA driver, which keeps the blast radius minimal.
+
+`--library-path` lists Plex's own library directory **first** because musl searches it before
+`DT_RPATH`; Plex's libraries must keep winning over the Alpine ones in the payload.
+
+### Why the wrapper is installed at runtime
+
+The image is `FROM plexinc/pms-docker:public`, which reinstalls Plex over
+`/usr/lib/plexmediaserver` at every container start. Anything patched into that directory at build
+time is discarded, so the wrapper has to be reapplied by an init hook that runs after
+`50-plex-update`. The hook is idempotent and fails soft in every branch: a server that transcodes
+on the CPU is a working server, one that will not start is not.
 
 ## Why no `LD_LIBRARY_PATH`
 
@@ -84,8 +106,8 @@ scripts run `bash`, `curl`, `xmlstarlet` and `dpkg` — all glibc binaries. Poin
 
 Instead every library in the payload gets `RPATH=$ORIGIN` (and `$ORIGIN:$ORIGIN/..` for
 `libgallium`, since `libva` dlopens the driver through the `dri/` symlink and musl expands `$ORIGIN`
-from that path without resolving it). Resolution is then entirely internal to the payload, and
-nothing outside it is affected.
+from that path without resolving it), and the wrapper passes `--library-path` to the loader, which
+is scoped to the transcoder alone.
 
 ## The libva version trap
 
@@ -101,12 +123,11 @@ message anywhere. Today the driver exports `__vaDriverInit_1_22` and Plex ships 
 
 Nothing in this repo controls it, by design.
 
-The image is built `FROM plexinc/pms-docker:public`. That tag contains **no** Plex binary; instead
-`/etc/cont-init.d/50-plex-update` runs at every container start, reads `version=public` from
-`/version.txt`, asks plex.tv for the newest release on the public channel (which needs no Plex
-token), and `dpkg -i`s it. Since this image adds only `/vaapi-amdgpu` and never touches
-`/usr/lib/plexmediaserver` or `/version.txt`, a Plex upgrade cannot disturb the driver, and the
-driver cannot pin Plex to an old version.
+`plexinc/pms-docker:public` contains **no** Plex binary; `/etc/cont-init.d/50-plex-update` runs at
+every container start, reads `version=public` from `/version.txt`, asks plex.tv for the newest
+release on the public channel (which needs no Plex token), and `dpkg -i`s it. This image adds only
+`/vaapi-amdgpu` and one init hook, and never touches `/version.txt`, so a Plex upgrade cannot
+disturb the driver and the driver cannot pin Plex to an old version.
 
 On the cluster a CronJob restarts the Plex pod nightly, so Plex updates itself daily. This image
 inherits that unchanged.
@@ -119,12 +140,16 @@ future Plex bumps musl or libva, CI goes red rather than transcoding silently dr
 
 `scripts/gate.sh` runs in its own build stage. None of it needs a GPU.
 
-1. **Relocation.** Plex's own musl loader resolves every symbol in the driver and its whole closure:
-   `ld-musl-x86_64.so.1 --library-path ... --list radeonsi_drv_video.so`. musl relocates eagerly, so
-   this fails exactly where `dlopen()` would, and `ldso_fail` exits 127 before ldd mode's `exit(0)`,
-   which makes the exit code trustworthy.
-2. **libva ABI.** The driver's exported `__vaDriverInit_1_N` must not exceed Plex's libva minor.
-3. **No second libc** in the payload, which would be silently ignored and hide a real version gap.
+1. **Relocation** — the driver and its whole closure resolve under the loader we ship. `ldso_fail`
+   exits 127 before ldd mode's `exit(0)`, so the exit code is trustworthy. Catches a dependency
+   missing from the payload.
+2. **libva ABI** — the driver's exported `__vaDriverInit_1_N` must not exceed Plex's libva minor.
+3. **Loader version** — the bundled musl must be newer than Plex's. The whole design rests on this;
+   if Plex ever catches up, the wrapper stops buying anything and this needs revisiting.
+
+Note what the gates deliberately do **not** claim: relocation is not execution. Constructors run at
+`dlopen`, not during a relocation check, which is exactly how the original `SIGSEGV` slipped past a
+green gate. Only the hardware test below covers that.
 
 ## Building and testing locally
 
@@ -135,22 +160,22 @@ docker buildx build --load -t plex-amd:test .  # the image
 
 ## Verifying against real hardware
 
-The driver only proves itself on a machine with the GPU. This exercises device access, driver load,
-symbol resolution and the libva handshake in one shot:
+Plex's ffmpeg is built `--disable-avdevice`, so there is no `lavfi` input — feed it raw NV12
+instead. This exercises device access, driver load, constructors and a real encode in one shot:
 
 ```sh
-docker run --rm --device /dev/dri/renderD128 --entrypoint /bin/bash plex-amd:test -c '
-  /usr/lib/plexmediaserver/Plex\ Transcoder -hide_banner \
+dd if=/dev/urandom of=/tmp/in.nv12 bs=1382400 count=30      # 30 frames of 1280x720
+docker run --rm --device /dev/dri/renderD128 -v /tmp:/tmp --entrypoint /bin/sh plex-amd:test -c '
+  "/usr/lib/plexmediaserver/Plex Transcoder" -hide_banner \
+    -f rawvideo -pix_fmt nv12 -s 1280x720 -r 30 -i /tmp/in.nv12 \
     -init_hw_device vaapi=hw:/dev/dri/renderD128 -filter_hw_device hw \
-    -f lavfi -i testsrc=size=1280x720:rate=30 -t 2 \
-    -vf format=nv12,hwupload -c:v h264_vaapi -f null -'
+    -vf hwupload -c:v h264_vaapi -f null -'
 ```
 
-Expect frames encoded, and no `Failed to initialise VAAPI` or `va_openDriver() returns -1`. Add
-`LIBVA_MESSAGING_LEVEL=2` to see libva's driver search.
+Expect `frame=30` and exit 0. `LIBVA_MESSAGING_LEVEL=2` shows libva's driver search.
 
-Note that `:public` downloads Plex at container start, so `Plex Transcoder` only exists after the
-container has run its init scripts once.
+Note that `:public` downloads Plex at container start, so `Plex Transcoder` and the wrapper only
+exist after the container has run its init scripts once.
 
 ## Turning it on
 
@@ -161,9 +186,9 @@ This image makes it possible; nothing here can enable it.
 ## Layout
 
 ```
-Dockerfile                    four stages: plex-ref, mesa, gate, image
-shim/plexcompat.c             musl >= 1.2.3 symbols Plex's 1.2.2 lacks
-scripts/collect-libs.sh       DT_NEEDED closure, RPATH, shim attachment
-scripts/gate.sh               the three compatibility gates
-.github/workflows/build.yml   push + weekly build to ghcr.io
+Dockerfile                                four stages: plex-ref, mesa, gate, image
+scripts/collect-libs.sh                   DT_NEEDED closure, the musl loader, RPATH
+scripts/gate.sh                           the three compatibility gates
+root/etc/cont-init.d/55-vaapi-transcoder  wraps the transcoder at every start
+.github/workflows/build.yml               push + weekly build to ghcr.io
 ```

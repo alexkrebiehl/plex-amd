@@ -1,9 +1,8 @@
 # Plex Media Server with a working AMD VAAPI driver.
 #
 # The official image ships no VA driver at all, so this adds Mesa's radeonsi
-# driver as a self-contained payload under /vaapi-amdgpu. It deliberately does
-# not touch /usr/lib/plexmediaserver, so Plex's own self-update mechanism keeps
-# working untouched. See README.md.
+# driver - and the musl loader it needs - as a self-contained payload under
+# /vaapi-amdgpu. See README.md for why the loader is the crux.
 
 # ---------------------------------------------------------------------------
 # 1. Plex's loader and libva, for the compatibility gates only. Never shipped.
@@ -24,19 +23,10 @@ RUN set -eux; \
        usr/lib/plexmediaserver/lib/libva.so.2 /plex/
 
 # ---------------------------------------------------------------------------
-# 2. The Mesa payload.
+# 2. The Mesa payload, plus the musl loader Mesa was built against.
 # ---------------------------------------------------------------------------
 FROM alpine:3.22 AS mesa
-RUN apk add --no-cache mesa-va-gallium patchelf binutils gcc musl-dev
-
-COPY shim/plexcompat.c /tmp/
-# Supplies the musl >= 1.2.3 symbols Plex's bundled 1.2.2 lacks. -nostdlib keeps
-# the shim free of dependencies of its own, so it cannot introduce a new gap.
-RUN mkdir -p /vaapi-amdgpu/lib \
- && gcc -shared -fPIC -O2 -fno-stack-protector -nostdlib \
-        -Wl,-soname,libplexcompat.so.1 \
-        -o /vaapi-amdgpu/lib/libplexcompat.so.1 /tmp/plexcompat.c
-
+RUN apk add --no-cache mesa-va-gallium patchelf binutils
 COPY scripts/collect-libs.sh /tmp/
 RUN /tmp/collect-libs.sh /vaapi-amdgpu
 
@@ -65,10 +55,21 @@ COPY --from=mesa /vaapi-amdgpu /vaapi-amdgpu
 # libdrm_amdgpu reads this from a path fixed at its compile time.
 COPY --from=mesa /vaapi-amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids
 
-# The only environment variable needed. LD_LIBRARY_PATH is deliberately NOT set:
-# it is global to the container, and Ubuntu's glibc tooling - bash, curl,
-# xmlstarlet and dpkg, all of which Plex's own startup scripts use - would pick
-# up these musl-linked libz.so.1 and libstdc++.so.6 and break. The payload
-# carries RPATH $ORIGIN instead, which resolves the same libraries with no
-# blast radius outside the driver.
+# Wraps "Plex Transcoder" so it runs under the payload's musl. Must happen at
+# every container start, not here: 50-plex-update reinstalls Plex over
+# /usr/lib/plexmediaserver on every start, discarding anything patched in at
+# build time.
+COPY root/ /
+RUN chmod 0755 /etc/cont-init.d/55-vaapi-transcoder \
+ && test -x /vaapi-amdgpu/lib/ld-musl-x86_64.so.1 \
+ && test -e /vaapi-amdgpu/lib/dri/radeonsi_drv_video.so
+
+# Where Plex's libva looks for the driver. Set here rather than in the wrapper
+# so it also applies if the transcoder is invoked by hand.
+#
+# LD_LIBRARY_PATH is deliberately NOT set: it is global to the container, and
+# Ubuntu's glibc tooling - bash, curl, xmlstarlet and dpkg, all of which Plex's
+# own startup scripts use - would pick up these musl-linked libz.so.1 and
+# libstdc++.so.6 and break. The wrapper passes --library-path to the loader
+# instead, which is scoped to the transcoder alone.
 ENV LIBVA_DRIVERS_PATH=/vaapi-amdgpu/lib/dri
