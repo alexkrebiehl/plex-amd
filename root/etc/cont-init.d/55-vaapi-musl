@@ -1,0 +1,74 @@
+#!/usr/bin/with-contenv bash
+#
+# Replace Plex's bundled musl 1.2.2 with the newer musl shipped in /vaapi-amdgpu.
+#
+# Plex's musl 1.2.2 cannot load this Mesa. First it cannot resolve qsort_r
+# (musl >= 1.2.3), and once that is supplied it segfaults in the driver's
+# constructors at an indirect call. The identical binaries, driver and GPU work
+# under musl 1.2.5 - verified with a real h264_vaapi encode.
+#
+# This has to cover Plex Media Server, not just the transcoder. PMS links
+# libavcodec/libavutil/libdrm directly and probes VAAPI *in process* to decide
+# whether hardware transcoding is available. If that probe fails, PMS logs
+# "hardware transcoding: enabled, but no hardware decode accelerator found" and
+# uses the CPU for everything - no matter what the transcoder alone could do.
+# Replacing the bundled libc covers every Plex binary at once, which is why this
+# is done instead of wrapping individual executables.
+#
+# musl is forward-compatible, so running Plex's 1.2.2-linked binaries on 1.2.5
+# is the safe direction. The build gates check that every Plex binary still
+# relocates cleanly under the loader shipped here.
+#
+# This runs at every container start rather than at build time because the image
+# is FROM plexinc/pms-docker:public, which reinstalls Plex over
+# /usr/lib/plexmediaserver on every start (50-plex-update, which runs just
+# before this) and restores the 1.2.2 files.
+#
+# Fails soft, always. A server that transcodes on the CPU is a working server;
+# one that will not start is not. Every bail-out below exits 0.
+
+PMS=/usr/lib/plexmediaserver
+PLEXLIB="$PMS/lib"
+NEW=/vaapi-amdgpu/lib/ld-musl-x86_64.so.1
+
+log() { echo "[vaapi] $*"; }
+
+if [ ! -x "$NEW" ]; then
+	log "no bundled musl at $NEW - leaving Plex alone"
+	exit 0
+fi
+
+if [ ! -d "$PLEXLIB" ]; then
+	log "no $PLEXLIB - leaving Plex alone"
+	exit 0
+fi
+
+# Undo the earlier wrapper approach if a container somehow still carries it.
+if [ -e "$PMS/Plex Transcoder.real" ]; then
+	mv -f "$PMS/Plex Transcoder.real" "$PMS/Plex Transcoder" 2>/dev/null &&
+		log "removed the obsolete transcoder wrapper"
+fi
+
+# In musl the loader and libc are the same file, and Plex ships it under both
+# names. Both are replaced: the binaries reference libc.so through their
+# RUNPATH, and ld-musl-x86_64.so.1 is what anything invoking the loader by name
+# picks up.
+replaced=0
+for name in ld-musl-x86_64.so.1 libc.so; do
+	target="$PLEXLIB/$name"
+	[ -e "$target" ] || continue
+	if cmp -s "$NEW" "$target"; then
+		continue
+	fi
+	if cp -f "$NEW" "$target"; then
+		replaced=$((replaced + 1))
+	else
+		log "WARNING: could not replace $target - hardware transcoding will not work"
+	fi
+done
+
+if [ "$replaced" -eq 0 ]; then
+	log "Plex already using the bundled musl"
+else
+	log "replaced Plex's musl with $("$NEW" 2>&1 | sed -n 's/^Version /musl /p') ($replaced file(s))"
+fi

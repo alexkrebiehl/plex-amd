@@ -5,8 +5,8 @@
 # an ordinary CI runner.
 set -eu
 
-PLEX_LOADER=/plex/ld-musl-x86_64.so.1
-PLEX_LIBVA=/plex/libva.so.2
+PLEX_LOADER=/plex/lib/ld-musl-x86_64.so.1
+PLEX_LIBVA=/plex/lib/libva.so.2
 PAYLOAD=/vaapi-amdgpu
 OUR_LOADER="$PAYLOAD/lib/ld-musl-x86_64.so.1"
 DRIVER="$PAYLOAD/lib/dri/radeonsi_drv_video.so"
@@ -44,9 +44,9 @@ echo "  driver exports __vaDriverInit_1_$drv_minor; Plex ships VA-API 1.$plex_mi
 
 echo "== gate 3: the loader we ship is newer than Plex's =="
 # The whole design rests on this. Plex's musl 1.2.2 cannot dlopen this Mesa - it
-# segfaults in the driver's constructors at an indirect call - so the transcoder
-# is launched with the loader from the payload instead. If Plex ever catches up,
-# the wrapper stops buying anything and this needs revisiting.
+# segfaults in the driver's constructors at an indirect call - so an init hook
+# replaces Plex's bundled libc with this one at every start. If Plex ever catches
+# up, the swap stops buying anything and this needs revisiting.
 ours=$(musl_version "$OUR_LOADER")
 theirs=$(musl_version "$PLEX_LOADER")
 [ -n "$ours" ] || fail "could not read the bundled loader's version"
@@ -55,7 +55,26 @@ echo "  payload musl $ours vs Plex musl $theirs"
 [ "$(as_int "$ours")" -ge "$(as_int "$theirs")" ] ||
 	fail "the bundled loader ($ours) is older than Plex's ($theirs)"
 if [ "$(as_int "$ours")" -eq "$(as_int "$theirs")" ]; then
-	echo "  WARNING: identical musl versions - the wrapper is buying nothing"
+	echo "  WARNING: identical musl versions - the swap is buying nothing"
 fi
+
+echo "== gate 4: every Plex binary still relocates under our loader =="
+# The hook replaces Plex's bundled libc outright, so every Plex executable ends
+# up running on the newer musl - not just the transcoder. musl is
+# forward-compatible, but it does drop symbols occasionally (the LFS64 aliases
+# went in 1.2.4), and a missing one would break Plex itself rather than merely
+# lose hardware transcoding. Check them all.
+bins=0
+for b in /plex/*; do
+	[ -f "$b" ] || continue
+	[ "$(head -c 4 "$b" | tr -d "\0")" = "$(printf "\177ELF")" ] || continue
+	bins=$((bins + 1))
+	if ! out=$("$OUR_LOADER" --library-path /plex/lib --list "$b" 2>&1); then
+		echo "$out" | grep -i "error\|not found" | head -3
+		fail "$(basename "$b") does not relocate under musl $(musl_version "$OUR_LOADER")"
+	fi
+done
+[ "$bins" -gt 0 ] || fail "found no Plex binaries to check"
+echo "  $bins Plex binaries relocate cleanly"
 
 echo "all gates passed"

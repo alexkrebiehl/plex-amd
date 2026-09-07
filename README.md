@@ -73,30 +73,43 @@ The A/B that settles it: **same transcoder binary, same driver, same GPU, only t
 | Plex's musl 1.2.2 | `SIGSEGV` during `dlopen` of the driver |
 | Alpine's musl 1.2.5 | 30 frames encoded, `h264_vaapi`, `speed=2.16x`, exit 0 |
 
-So the fix is not a shim — it is to run the transcoder under the newer loader. The payload ships
-`ld-musl-x86_64.so.1` from the same Alpine as Mesa, and `/etc/cont-init.d/55-vaapi-transcoder`
-replaces `Plex Transcoder` with a wrapper that exec's it:
+The same A/B with Plex's bundled libc replaced in place, rather than the loader forced on the
+command line, gives the same result - which is what the init hook does.
 
-```sh
-exec /vaapi-amdgpu/lib/ld-musl-x86_64.so.1 \
-  --library-path /usr/lib/plexmediaserver/lib:/vaapi-amdgpu/lib \
-  "/usr/lib/plexmediaserver/Plex Transcoder.real" "$@"
-```
+So the fix is not a shim - it is to run Plex on the newer loader. The payload ships
+`ld-musl-x86_64.so.1` from the same Alpine as Mesa, and `/etc/cont-init.d/55-vaapi-musl` copies it
+over Plex's own `lib/ld-musl-x86_64.so.1` and `lib/libc.so` (in musl these are the same file, and
+Plex ships it under both names).
 
 Plex's binaries are built against musl 1.2.2, and musl is forward-compatible, so running them on
-1.2.5 is the safe direction. Only the transcoder is wrapped — it is the only process that loads the
-VA driver, which keeps the blast radius minimal.
+1.2.5 is the safe direction. Gate 4 checks that every Plex binary still relocates cleanly under it.
 
-`--library-path` lists Plex's own library directory **first** because musl searches it before
-`DT_RPATH`; Plex's libraries must keep winning over the Alpine ones in the payload.
+### Why it is not enough to wrap the transcoder
 
-### Why the wrapper is installed at runtime
+The first version of this fix wrapped `Plex Transcoder` alone, on the reasoning that it is the only
+process that loads the VA driver. It isn't. **`Plex Media Server` links libavcodec, libavutil and
+libdrm directly and probes VAAPI in-process** to decide whether hardware transcoding is available.
+With only the transcoder wrapped, that probe still ran on musl 1.2.2 and failed, so Plex concluded
+there was no hardware at all and used the CPU for everything:
+
+```
+ERROR - [FFMPEG] - libva: dlopen of .../radeonsi_drv_video.so failed:
+        Error relocating .../radeonsi_drv_video.so: qsort_r: symbol not found
+DEBUG - Codecs: hardware transcoding: opening hw device failed - probably not supported by this system
+DEBUG - TPU: hardware transcoding: enabled, but no hardware decode accelerator found
+```
+
+Note `hardware transcoding: enabled` - the Plex setting was on. The capability probe is what failed.
+Replacing the bundled libc covers every Plex binary at once, which is why that is done instead of
+wrapping individual executables.
+
+### Why the swap happens at runtime
 
 The image is `FROM plexinc/pms-docker:public`, which reinstalls Plex over
-`/usr/lib/plexmediaserver` at every container start. Anything patched into that directory at build
-time is discarded, so the wrapper has to be reapplied by an init hook that runs after
-`50-plex-update`. The hook is idempotent and fails soft in every branch: a server that transcodes
-on the CPU is a working server, one that will not start is not.
+`/usr/lib/plexmediaserver` at every container start, restoring the 1.2.2 files. So the swap has to
+be reapplied by an init hook that runs after `50-plex-update`. The hook is idempotent and fails soft
+in every branch: a server that transcodes on the CPU is a working server, one that will not start is
+not.
 
 ## Why no `LD_LIBRARY_PATH`
 
@@ -106,8 +119,8 @@ scripts run `bash`, `curl`, `xmlstarlet` and `dpkg` — all glibc binaries. Poin
 
 Instead every library in the payload gets `RPATH=$ORIGIN` (and `$ORIGIN:$ORIGIN/..` for
 `libgallium`, since `libva` dlopens the driver through the `dri/` symlink and musl expands `$ORIGIN`
-from that path without resolving it), and the wrapper passes `--library-path` to the loader, which
-is scoped to the transcoder alone.
+from that path without resolving it), so the payload resolves internally with no environment
+variable at all.
 
 ## The libva version trap
 
@@ -144,12 +157,15 @@ future Plex bumps musl or libva, CI goes red rather than transcoding silently dr
    exits 127 before ldd mode's `exit(0)`, so the exit code is trustworthy. Catches a dependency
    missing from the payload.
 2. **libva ABI** — the driver's exported `__vaDriverInit_1_N` must not exceed Plex's libva minor.
-3. **Loader version** — the bundled musl must be newer than Plex's. The whole design rests on this;
-   if Plex ever catches up, the wrapper stops buying anything and this needs revisiting.
+3. **Loader version** - the bundled musl must be newer than Plex's. The whole design rests on this;
+   if Plex ever catches up, the swap stops buying anything and this needs revisiting.
+4. **Every Plex binary relocates** under the loader we ship. The hook replaces Plex's libc outright,
+   so all of Plex runs on it - and musl does drop symbols occasionally (the LFS64 aliases went in
+   1.2.4). A missing one would break Plex itself, not merely lose hardware transcoding.
 
 Note what the gates deliberately do **not** claim: relocation is not execution. Constructors run at
 `dlopen`, not during a relocation check, which is exactly how the original `SIGSEGV` slipped past a
-green gate. Only the hardware test below covers that.
+green gate. Nor can they see Plex's own capability probe. Only the hardware test below covers that.
 
 ## Building and testing locally
 
@@ -174,8 +190,16 @@ docker run --rm --device /dev/dri/renderD128 -v /tmp:/tmp --entrypoint /bin/sh p
 
 Expect `frame=30` and exit 0. `LIBVA_MESSAGING_LEVEL=2` shows libva's driver search.
 
-Note that `:public` downloads Plex at container start, so `Plex Transcoder` and the wrapper only
-exist after the container has run its init scripts once.
+Note that `:public` downloads Plex at container start, so `Plex Transcoder` only exists after the
+container has run its init scripts once.
+
+The end-to-end check is Plex's own log, which records the decision the server actually made:
+
+```sh
+kubectl -n plex logs plex-plex-media-server-0 | grep -i "hardware transcoding"
+# want: "final decoder: h264_vaapi, final encoder: h264_vaapi"
+# not:  "enabled, but no hardware decode accelerator found"
+```
 
 ## Turning it on
 
@@ -189,6 +213,6 @@ This image makes it possible; nothing here can enable it.
 Dockerfile                                four stages: plex-ref, mesa, gate, image
 scripts/collect-libs.sh                   DT_NEEDED closure, the musl loader, RPATH
 scripts/gate.sh                           the three compatibility gates
-root/etc/cont-init.d/55-vaapi-transcoder  wraps the transcoder at every start
+root/etc/cont-init.d/55-vaapi-musl        swaps Plex's libc at every start
 .github/workflows/build.yml               push + weekly build to ghcr.io
 ```
