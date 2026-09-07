@@ -1,0 +1,72 @@
+name: Publish container image
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly. Picks up Mesa and base-image updates, and re-runs the compatibility
+    # gates against whatever Plex has shipped since - so a musl or libva change
+    # on Plex's side turns CI red instead of silently dropping Plex back to CPU
+    # transcoding.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compatibility gates
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: gate
+          push: false
+          # Distinct scopes: the two builds would otherwise overwrite each
+          # other's cache entry and thrash on every run.
+          cache-from: type=gha,scope=gate
+          cache-to: type=gha,mode=max,scope=gate
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # plexinc/pms-docker:public is a single amd64 manifest, not a list.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=image
+            type=gha,scope=gate
+          cache-to: type=gha,mode=max,scope=image
+          provenance: true
