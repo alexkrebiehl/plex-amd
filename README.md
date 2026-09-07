@@ -111,6 +111,26 @@ be reapplied by an init hook that runs after `50-plex-update`. The hook is idemp
 in every branch: a server that transcodes on the CPU is a working server, one that will not start is
 not.
 
+## Plex's other build-machine paths
+
+Plex's bundled libraries carry paths from the machine that built them, and two of them show up in
+the container log at every start. Both are cosmetic; the init hook fixes both.
+
+`libdrm_amdgpu.so.1` looks for `amdgpu.ids` under its conan build directory:
+
+```
+/home/runner/_work/plex-conan/.../meson-install/share/libdrm/amdgpu.ids: No such file or directory
+```
+
+That file only maps PCI id + revision to a marketing name, so nothing breaks - Plex still reports
+`AMD Granite Ridge [Radeon Graphics]` and transcodes in hardware. Note that Plex's copy of
+`libdrm_amdgpu` wins over the payload's: Plex's own RUNPATH resolves the soname first, and musl
+reuses an already-loaded soname. So shipping `amdgpu.ids` at `/usr/share/libdrm/` does not help on
+its own - the hook symlinks it into the path Plex's binary actually asks for, read out of the
+binary rather than hardcoded so it survives Plex bumping its libdrm.
+
+The second is the shader cache, described under Verifying below.
+
 ## Why no `LD_LIBRARY_PATH`
 
 `LD_LIBRARY_PATH` is global to the container. The base image is Ubuntu, and Plex's own startup
@@ -226,6 +246,6 @@ This image makes it possible; nothing here can enable it.
 Dockerfile                                four stages: plex-ref, mesa, gate, image
 scripts/collect-libs.sh                   DT_NEEDED closure, the musl loader, RPATH
 scripts/gate.sh                           the three compatibility gates
-root/etc/cont-init.d/55-vaapi-musl        swaps Plex's libc, repairs cache ownership
+root/etc/cont-init.d/55-vaapi-musl        swaps Plex's libc, fixes cache + amdgpu.ids paths
 .github/workflows/build.yml               push + weekly build to ghcr.io
 ```

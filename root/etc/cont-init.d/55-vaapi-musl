@@ -99,3 +99,33 @@ if [ -d "$cachedir" ] && [ "$(stat -c %u "$cachedir" 2>/dev/null)" != "$(id -u p
 		log "WARNING: $cachedir is not writable by plex; Mesa will recompile shaders each run"
 	fi
 fi
+
+# Point Plex's libdrm_amdgpu at an amdgpu.ids it can actually find.
+#
+# Plex's bundled libdrm_amdgpu.so.1 has the path to amdgpu.ids baked in as its
+# build machine's conan directory, which of course does not exist here:
+#
+#   /home/runner/_work/plex-conan/.../meson-install/share/libdrm/amdgpu.ids:
+#   No such file or directory
+#
+# Plex's copy wins over the payload's because Plex's own RUNPATH resolves
+# libdrm_amdgpu.so.1 first, and once a soname is loaded musl reuses it - so the
+# copy at /usr/share/libdrm/amdgpu.ids is never consulted.
+#
+# The file only maps PCI id + revision to a marketing name, so the cost of it
+# missing is cosmetic. Symlinking it is free and removes seven lines of noise
+# from every startup. The path is read out of the binary rather than hardcoded,
+# so it keeps working when Plex bumps its bundled libdrm.
+IDS=/vaapi-amdgpu/share/libdrm/amdgpu.ids
+if [ -e "$IDS" ] && [ -e "$PLEXLIB/libdrm_amdgpu.so.1" ]; then
+	want=$(tr -c '[:print:]' '\n' < "$PLEXLIB/libdrm_amdgpu.so.1" 2>/dev/null |
+		grep -m1 '/share/libdrm/amdgpu\.ids$')
+	case "$want" in
+	/*)
+		if [ ! -e "$want" ] && mkdir -p "$(dirname "$want")" 2>/dev/null &&
+			ln -sf "$IDS" "$want" 2>/dev/null; then
+			log "linked amdgpu.ids into the path Plex's libdrm expects"
+		fi
+		;;
+	esac
+fi
